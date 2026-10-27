@@ -125,20 +125,24 @@ enum FunctionCallingSupport {
 
 /// Resolve function calling support for the selected provider/model.
 ///
-/// Native Ollama capabilities are model-specific. Missing metadata is kept as
-/// unknown so older servers and compatible proxies can still attempt tools.
+/// Native Ollama capabilities and LiteLLM proxy aliases are model-specific.
+/// Missing metadata is kept as unknown so older servers and compatible proxies
+/// can still attempt tools.
 async fn provider_function_calling_support(config: &AiConfig) -> FunctionCallingSupport {
-    if !matches!(config.provider, AiProvider::Ollama) {
-        return FunctionCallingSupport::Supported;
-    }
+    let support = match config.provider {
+        AiProvider::Ollama => ai::ollama_selected_model_tool_support(config).await,
+        AiProvider::Litellm => ai::litellm_selected_model_tool_support(config).await,
+        _ => return FunctionCallingSupport::Supported,
+    };
 
-    match ai::ollama_selected_model_tool_support(config).await {
+    match support {
         Ok(Some(true)) => FunctionCallingSupport::Supported,
         Ok(Some(false)) => FunctionCallingSupport::Unsupported,
         Ok(None) => FunctionCallingSupport::Unknown,
         Err(error) => {
             log::debug!(
-                "[agent][ollama] tool capability unavailable for model {}: {error}; attempting tool call",
+                "[agent][{}] tool capability unavailable for model {}: {error}; attempting tool call",
+                config.provider.as_str(),
                 config.model
             );
             FunctionCallingSupport::Unknown
@@ -430,12 +434,13 @@ async fn run_agent_loop_inner(
                 }
                 Err(err)
                     if turn == 0
-                        && matches!(config.provider, AiProvider::Ollama)
+                        && matches!(config.provider, AiProvider::Ollama | AiProvider::Litellm)
                         && is_tool_unsupported_error(&err)
                         && !emitted_any_chunk.load(Ordering::Relaxed) =>
                 {
                     log::debug!(
-                        "[agent][ollama] model {} rejected tools before producing output; falling back to text-only mode",
+                        "[agent][{}] model {} rejected tools before producing output; falling back to text-only mode",
+                        config.provider.as_str(),
                         config.model
                     );
                     on_event(AgentEvent::TurnEnd { turn });

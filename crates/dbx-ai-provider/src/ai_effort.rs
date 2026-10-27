@@ -53,6 +53,12 @@ fn integer_capability(min: i64, max: i64, allow_disabled: bool, source: AiCapabi
     AiEffortCapability::Integer { min, max, step: 1, default: AiEffortSelection::Integer(-1), special_values, source }
 }
 
+/// Reasoning levels for a LiteLLM model whose model map reports reasoning
+/// support; the proxy translates `reasoning_effort` to each upstream's controls.
+pub(crate) fn litellm_reasoning_capability() -> AiEffortCapability {
+    enum_capability(&["low", "medium", "high"], AiCapabilitySource::ProviderApi)
+}
+
 fn boolean_capability(source: AiCapabilitySource) -> AiEffortCapability {
     AiEffortCapability::Boolean { default: AiEffortSelection::ProviderDefault, source }
 }
@@ -88,6 +94,8 @@ pub fn static_effort_capability(config: &AiConfig, model_id: &str) -> Option<AiE
         }
         AiProvider::MiniMax if matches_family(&model, "minimax-m3") => Some(boolean_capability(source)),
         AiProvider::MiniMax => None,
+        // Read per model from the proxy's `/model/info` during discovery.
+        AiProvider::Litellm => None,
         AiProvider::AnthropicCompatible | AiProvider::OpenaiCompatible | AiProvider::Custom => {
             Some(AiEffortCapability::FreeText { placeholder: None, source: AiCapabilitySource::Custom })
         }
@@ -220,6 +228,7 @@ pub fn registry_source_url(provider: &AiProvider) -> Option<&'static str> {
         AiProvider::Claude
         | AiProvider::AnthropicCompatible
         | AiProvider::OpenaiCompatible
+        | AiProvider::Litellm
         | AiProvider::CodexCli
         | AiProvider::ClaudeCodeCli
         | AiProvider::PiAgentCli
@@ -258,7 +267,12 @@ pub fn validate_runtime_effort(config: &AiConfig) -> Result<(), String> {
         };
     }
 
-    let capability = static_effort_capability(config, &config.model).unwrap_or(AiEffortCapability::Unsupported);
+    // LiteLLM levels come from the proxy's `/model/info` at discovery, not a static registry.
+    let capability = if matches!(config.provider, AiProvider::Litellm) {
+        litellm_reasoning_capability()
+    } else {
+        static_effort_capability(config, &config.model).unwrap_or(AiEffortCapability::Unsupported)
+    };
     let valid = match capability {
         AiEffortCapability::Enum { options, .. } => options.iter().any(|option| option.selection == *selection),
         AiEffortCapability::Integer { min, max, step, special_values, .. } => {
@@ -296,7 +310,9 @@ pub fn apply_runtime_effort(body: &mut Value, config: &AiConfig) {
         AiProvider::Qwen => apply_qwen_effort(object, selection),
         AiProvider::Zhipu | AiProvider::Ollama => apply_openai_effort(object, &config.api_style, selection),
         AiProvider::MiniMax => apply_minimax_effort(object, &config.model, selection),
-        AiProvider::Openai | AiProvider::OpenaiCompatible => apply_openai_effort(object, &config.api_style, selection),
+        AiProvider::Openai | AiProvider::OpenaiCompatible | AiProvider::Litellm => {
+            apply_openai_effort(object, &config.api_style, selection)
+        }
         AiProvider::Custom => {
             if config.api_style == AiApiStyle::AnthropicMessages {
                 apply_claude_effort(object, selection);
@@ -676,6 +692,17 @@ mod tests {
         let mut chat_body = json!({});
         apply_runtime_effort(&mut chat_body, &responses);
         assert_eq!(chat_body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn litellm_accepts_the_reasoning_levels_discovery_offers() {
+        let mut config = config(AiProvider::Litellm, "gemini-2.5-flash");
+        for level in ["low", "medium", "high"] {
+            config.runtime_effort = Some(AiEffortSelection::Enum(level.to_string()));
+            assert!(validate_runtime_effort(&config).is_ok(), "{level}");
+        }
+        config.runtime_effort = Some(AiEffortSelection::Enum("turbo".to_string()));
+        assert!(validate_runtime_effort(&config).is_err());
     }
 
     #[test]

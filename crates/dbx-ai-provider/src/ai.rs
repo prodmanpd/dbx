@@ -91,6 +91,7 @@ pub enum AiProvider {
     Zhipu,
     MiniMax,
     Ollama,
+    Litellm,
     #[serde(rename = "openai-compatible")]
     OpenaiCompatible,
     #[serde(rename = "codex-cli")]
@@ -125,6 +126,7 @@ impl AiProvider {
             AiProvider::Zhipu => "zhipu",
             AiProvider::MiniMax => "minimax",
             AiProvider::Ollama => "ollama",
+            AiProvider::Litellm => "litellm",
             AiProvider::OpenaiCompatible => "openai-compatible",
             AiProvider::ClaudeCodeCli => "claude-code-cli",
             AiProvider::PiAgentCli => "pi-agent-cli",
@@ -1001,6 +1003,7 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
         | AiProvider::Zhipu
         | AiProvider::MiniMax
         | AiProvider::Ollama
+        | AiProvider::Litellm
         | AiProvider::OpenaiCompatible
         | AiProvider::Custom => {
             let base = ensure_openai_version_prefix(ep);
@@ -1044,6 +1047,7 @@ fn uses_openai_style_api(config: &AiConfig) -> bool {
                 | AiProvider::Qwen
                 | AiProvider::MiniMax
                 | AiProvider::Ollama
+                | AiProvider::Litellm
                 | AiProvider::OpenaiCompatible
                 | AiProvider::Custom
         )
@@ -1491,9 +1495,18 @@ fn apply_minimax_chat_completion_fields(body: &mut serde_json::Value, config: &A
     }
 }
 
+fn apply_litellm_chat_completion_fields(body: &mut serde_json::Value, config: &AiConfig) {
+    if matches!(config.provider, AiProvider::Litellm) {
+        // One proxy fronts many upstreams; have it drop a parameter the selected
+        // upstream rejects (e.g. reasoning_effort) instead of failing the request.
+        body["drop_params"] = json!(true);
+    }
+}
+
 fn decorate_chat_completion_body(body: &mut serde_json::Value, config: &AiConfig, max_tokens: Option<u32>) {
     set_chat_completion_token_limit(body, config, max_tokens);
     apply_minimax_chat_completion_fields(body, config);
+    apply_litellm_chat_completion_fields(body, config);
     apply_chat_completion_thinking_toggle(body, config);
     crate::ai_effort::apply_runtime_effort(body, config);
 }
@@ -1532,6 +1545,11 @@ fn apply_chat_completion_thinking_toggle(body: &mut serde_json::Value, config: &
     if is_openai_api_config(config) {
         // `extra_body.chat_template_kwargs` is a third-party compatibility extension,
         // not an OpenAI API parameter. OpenAI models use their native defaults here.
+        return;
+    }
+    if matches!(config.provider, AiProvider::Litellm) {
+        // The proxy forwards vendor toggles verbatim, and Anthropic or Gemini
+        // upstreams reject `chat_template_kwargs`; keep the model's default.
         return;
     }
 
@@ -2252,6 +2270,101 @@ pub async fn ollama_selected_model_tool_support(config: &AiConfig) -> Result<Opt
     Ok(crate::ai_model_filter::ollama_tool_capability(&data))
 }
 
+// ---------------------------------------------------------------------------
+// LiteLLM proxy
+// ---------------------------------------------------------------------------
+
+/// `/model/info` lives at the proxy root, beside the `/v1` OpenAI routes.
+fn resolve_litellm_model_info_endpoint(config: &AiConfig) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(&resolve_model_list_endpoint(config)?)
+        .map_err(|e| format!("Invalid LiteLLM endpoint: {e}"))?;
+    let path = url.path().trim_end_matches('/');
+    let base_path =
+        path.strip_suffix("/v1/models").or_else(|| path.strip_suffix("/models")).unwrap_or(path).trim_end_matches('/');
+    url.set_path(&format!("{base_path}/model/info"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+async fn fetch_litellm_model_info(client: &reqwest::Client, config: &AiConfig) -> Result<serde_json::Value, String> {
+    let res = client
+        .get(resolve_litellm_model_info_endpoint(config)?)
+        .headers(maybe_bearer_headers(config)?)
+        .send()
+        .await
+        .map_err(|e| format_request_error("LiteLLM model info", e))?;
+    let status = res.status();
+    let data: serde_json::Value = res.json().await.map_err(|e| format_response_body_error("LiteLLM model info", e))?;
+    if !status.is_success() {
+        return Err(redacted_http_detail(
+            &data,
+            format!("LiteLLM model info API error: {status}"),
+            &sensitive_values(config),
+        ));
+    }
+    Ok(data)
+}
+
+/// Chat models the proxy serves, with reasoning support from LiteLLM's model
+/// map. Keys that may not read `/model/info` fall back to `/v1/models`.
+async fn list_litellm_models(client: &reqwest::Client, config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    match fetch_litellm_model_info(client, config).await {
+        Ok(data) => parse_litellm_model_info(&data),
+        Err(error) => {
+            log::debug!("[ai][models] {error}; falling back to the LiteLLM /models list");
+            list_openai_compatible_models(client, config).await
+        }
+    }
+}
+
+fn parse_litellm_model_info(data: &serde_json::Value) -> Result<Vec<AiModelInfo>, String> {
+    let items = data["data"].as_array().ok_or_else(|| "Invalid LiteLLM model info response".to_string())?;
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    for item in items {
+        let Some(name) = item["model_name"].as_str().map(str::trim).filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        // Wildcard routes (`anthropic/*`) are patterns, not callable model ids.
+        if name.contains('*') || !litellm_item_is_chat(item) || !seen.insert(name.to_string()) {
+            continue;
+        }
+        let mut model = AiModelInfo::new(name, None);
+        model.effort_capability = match item["model_info"]["supports_reasoning"].as_bool() {
+            Some(true) => Some(crate::ai_effort::litellm_reasoning_capability()),
+            Some(false) => Some(AiEffortCapability::Unsupported),
+            None => None,
+        };
+        models.push(model);
+    }
+    Ok(models)
+}
+
+fn litellm_item_is_chat(item: &serde_json::Value) -> bool {
+    // An unset mode is an alias LiteLLM can't classify (often a self-hosted model); keep it.
+    item["model_info"]["mode"].as_str().is_none_or(|mode| mode == "chat")
+}
+
+fn litellm_tool_capability(data: &serde_json::Value, model_id: &str) -> Option<bool> {
+    data["data"]
+        .as_array()?
+        .iter()
+        .find(|item| item["model_name"].as_str().map(str::trim) == Some(model_id))
+        .and_then(|item| item["model_info"]["supports_function_calling"].as_bool())
+}
+
+/// Function calling support the proxy reports for the selected model, when known.
+pub async fn litellm_selected_model_tool_support(config: &AiConfig) -> Result<Option<bool>, String> {
+    let model_id = config.model.trim();
+    if model_id.is_empty() {
+        return Err("Model is required".to_string());
+    }
+    let client = build_ai_http_client(config, 5)?;
+    let data = fetch_litellm_model_info(&client, config).await?;
+    Ok(litellm_tool_capability(&data, model_id))
+}
+
 async fn retain_ollama_completion_models(
     client: &reqwest::Client,
     config: &AiConfig,
@@ -2306,6 +2419,7 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
                     let models = list_openai_compatible_models(&client, config).await?;
                     retain_ollama_completion_models(&client, config, models).await
                 }
+                AiProvider::Litellm => list_litellm_models(&client, config).await?,
                 AiProvider::Openai
                 | AiProvider::Deepseek
                 | AiProvider::Kimi
@@ -3750,6 +3864,7 @@ pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
                 | AiProvider::Zhipu
                 | AiProvider::MiniMax
                 | AiProvider::Ollama
+                | AiProvider::Litellm
                 | AiProvider::OpenaiCompatible => {
                     if request.config.api_style == AiApiStyle::Responses {
                         call_responses_api(&client, request).await
@@ -3813,6 +3928,7 @@ pub async fn stream(
         | AiProvider::Zhipu
         | AiProvider::MiniMax
         | AiProvider::Ollama
+        | AiProvider::Litellm
         | AiProvider::OpenaiCompatible => {
             if request.config.api_style == AiApiStyle::Responses {
                 stream_responses_api(&client, session_id, request, cancelled, &on_chunk).await
@@ -5332,6 +5448,10 @@ mod tests {
         AiModelInfo, AiProvider, AiReasoningLevel, MiniMaxStreamDelta, MiniMaxStreamState, MiniMaxTextAccumulator,
         StreamToolEvent, StreamingToolCallAccumulator, ToolCallRef, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, CONTENT_TYPE,
         MINIMAX_REASONING_DETAILS_PAYLOAD_KEY, TEST_PROMPT,
+    };
+    use super::{
+        litellm_selected_model_tool_support, litellm_tool_capability, parse_litellm_model_info,
+        resolve_litellm_model_info_endpoint,
     };
     use super::{redacted_http_detail, sensitive_values};
 
@@ -7330,6 +7450,111 @@ mod tests {
 
         assert_eq!(ollama_selected_model_tool_support(&config).await.unwrap(), Some(true));
         assert_eq!(server.await.unwrap().body["model"], "qwen3:0.6b");
+    }
+
+    fn litellm_test_config(endpoint: &str) -> AiConfig {
+        let mut config = test_config(AiProvider::Litellm);
+        config.endpoint = endpoint.to_string();
+        config.model = "claude-sonnet".to_string();
+        config
+    }
+
+    const LITELLM_MODEL_INFO: &str = r#"{"data":[
+        {"model_name":"claude-sonnet","model_info":{"mode":"chat","supports_reasoning":true,"supports_function_calling":true}},
+        {"model_name":"claude-sonnet","model_info":{"mode":"chat","supports_reasoning":true,"supports_function_calling":true}},
+        {"model_name":"gpt-4.1-mini","model_info":{"mode":"chat","supports_reasoning":false,"supports_function_calling":true}},
+        {"model_name":"local-llama","model_info":{"mode":null}},
+        {"model_name":"emb-small","model_info":{"mode":"embedding"}},
+        {"model_name":"anthropic/*","model_info":{"mode":"chat"}}
+    ]}"#;
+
+    #[test]
+    fn litellm_provider_serializes_as_litellm() {
+        assert_eq!(serde_json::to_string(&AiProvider::Litellm).unwrap(), r#""litellm""#);
+        assert_eq!(serde_json::from_str::<AiProvider>(r#""litellm""#).unwrap().as_str(), "litellm");
+    }
+
+    #[test]
+    fn litellm_model_info_endpoint_sits_at_the_proxy_root() {
+        for (endpoint, expected) in [
+            ("http://localhost:4000/v1", "http://localhost:4000/model/info"),
+            ("http://localhost:4000/v1/", "http://localhost:4000/model/info"),
+            ("http://localhost:4000", "http://localhost:4000/model/info"),
+            ("https://gateway.example/litellm/v1", "https://gateway.example/litellm/model/info"),
+        ] {
+            assert_eq!(resolve_litellm_model_info_endpoint(&litellm_test_config(endpoint)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn litellm_model_info_keeps_chat_aliases_and_maps_reasoning_support() {
+        let data: serde_json::Value = serde_json::from_str(LITELLM_MODEL_INFO).unwrap();
+        let models = parse_litellm_model_info(&data).unwrap();
+
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["claude-sonnet", "gpt-4.1-mini", "local-llama"]);
+        assert!(matches!(models[0].effort_capability, Some(AiEffortCapability::Enum { .. })));
+        assert!(matches!(models[1].effort_capability, Some(AiEffortCapability::Unsupported)));
+        assert!(models[2].effort_capability.is_none());
+    }
+
+    #[test]
+    fn litellm_tool_capability_reads_the_selected_alias() {
+        let data: serde_json::Value = serde_json::from_str(LITELLM_MODEL_INFO).unwrap();
+
+        assert_eq!(litellm_tool_capability(&data, "claude-sonnet"), Some(true));
+        assert_eq!(litellm_tool_capability(&data, "local-llama"), None);
+        assert_eq!(litellm_tool_capability(&data, "not-served"), None);
+    }
+
+    #[tokio::test]
+    async fn litellm_model_list_reads_model_info_without_a_key() {
+        let (endpoint, server) = spawn_get_response_server("200 OK", LITELLM_MODEL_INFO).await;
+        let config = litellm_test_config(&format!("{endpoint}/v1"));
+
+        let models = list_models_core(&config).await.unwrap();
+        let request = server.await.unwrap();
+
+        assert!(request.starts_with("GET /model/info "), "{request}");
+        assert!(!request.to_ascii_lowercase().contains("authorization:"), "keyless proxy must not get a bearer header");
+        assert_eq!(
+            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            ["claude-sonnet", "gpt-4.1-mini", "local-llama"]
+        );
+    }
+
+    #[tokio::test]
+    async fn litellm_selected_model_tool_support_sends_the_virtual_key() {
+        let (endpoint, server) = spawn_get_response_server("200 OK", LITELLM_MODEL_INFO).await;
+        let mut config = litellm_test_config(&format!("{endpoint}/v1"));
+        config.api_key = "sk-virtual".to_string();
+        config.model = "gpt-4.1-mini".to_string();
+
+        assert_eq!(litellm_selected_model_tool_support(&config).await.unwrap(), Some(true));
+        assert!(server.await.unwrap().to_ascii_lowercase().contains("authorization: bearer sk-virtual"));
+    }
+
+    #[test]
+    fn litellm_chat_completion_body_drops_unsupported_params_and_skips_vendor_toggles() {
+        let mut config = litellm_test_config("http://localhost:4000/v1");
+        config.enable_thinking = false;
+        let mut body = serde_json::json!({ "model": &config.model });
+
+        decorate_chat_completion_body(&mut body, &config, Some(1024));
+
+        assert_eq!(body["drop_params"], true);
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("extra_body").is_none(), "chat_template_kwargs would be forwarded to the upstream");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn litellm_routes_to_chat_completions_and_allows_a_keyless_proxy() {
+        let config = litellm_test_config("http://localhost:4000/v1");
+
+        assert_eq!(resolve_endpoint(&config), "http://localhost:4000/v1/chat/completions");
+        assert!(!provider_requires_api_key(&AiProvider::Litellm));
+        assert!(validate_config(&config).is_ok());
     }
 
     #[tokio::test]

@@ -423,6 +423,16 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     authMethod: "bearer",
     requiresApiKey: false,
   },
+  litellm: {
+    label: "LiteLLM",
+    provider: "litellm",
+    // Self-hosted proxy; the key is a virtual or master key and is optional.
+    endpoint: "http://localhost:4000/v1",
+    model: "",
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: false,
+  },
   "anthropic-compatible": {
     label: "Anthropic Compatible",
     iconSlug: "anthropic",
@@ -779,6 +789,7 @@ function inferAiProviderFromConfig(config: Partial<AiConfig> | null | undefined)
   if (endpoint.includes("generativelanguage.googleapis.com") || model.includes("gemini")) return "gemini";
   if (endpoint.includes("minimax.io") || endpoint.includes("minimaxi.com") || model.includes("minimax")) return "minimax";
   if (endpoint.includes("localhost:11434") || endpoint.includes("127.0.0.1:11434")) return "ollama";
+  if (endpoint.includes("localhost:4000") || endpoint.includes("127.0.0.1:4000")) return "litellm";
   if (endpoint.includes("openai.com") || model.startsWith("gpt-")) return "openai";
   return "claude";
 }
